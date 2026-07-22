@@ -16,7 +16,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	mcpauth "github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/modelcontextprotocol/go-sdk/oauthex"
 
 	mcpregistry "github.com/agentregistry-dev/agentregistry/internal/mcp/registryserver"
 	"github.com/agentregistry-dev/agentregistry/internal/registry/api"
@@ -161,7 +163,8 @@ func App(ctx context.Context, opts ...types.AppOptions) error {
 		}
 	}()
 
-	routeOpts := buildRouteOptions(options, stores, deploymentAdapters, crudPerKindHooks(options))
+	perKindHooks := crudPerKindHooks(options)
+	routeOpts := buildRouteOptions(options, stores, deploymentAdapters, perKindHooks)
 
 	// Initialize HTTP server
 	baseServer, err := api.NewServer(cfg, metrics, versionInfo, options.UIHandler, authnProvider, routeOpts)
@@ -180,7 +183,13 @@ func App(ctx context.Context, opts ...types.AppOptions) error {
 		options.OnHTTPServerCreated(server)
 	}
 
-	mcpHTTPServer := startMCPServer(cfg, stores, authnProvider)
+	// The bridge may use a dedicated authn provider (e.g. one that adds MCP
+	// audience validation) without affecting server traffic.
+	mcpAuthnProvider := options.MCPAuthnProvider
+	if mcpAuthnProvider == nil {
+		mcpAuthnProvider = authnProvider
+	}
+	mcpHTTPServer := startMCPServer(cfg, stores, mcpAuthnProvider, perKindHooks, options.MCPProtectedResourceMetadata, options.MCPResourceMetadataURL)
 
 	// Start server in a goroutine so it doesn't block signal handling
 	go func() {
@@ -504,25 +513,21 @@ func startMCPServer(
 	cfg *config.Config,
 	stores map[string]*v1alpha1store.Store,
 	authnProvider auth.AuthnProvider,
+	hooks crud.PerKindHooks,
+	resourceMetadata *oauthex.ProtectedResourceMetadata,
+	resourceMetadataURL string,
 ) *http.Server {
 	if cfg.MCPPort <= 0 {
 		return nil
 	}
-	mcpServer := mcpregistry.NewServer(stores)
+	mcpServer := mcpregistry.NewServer(stores, hooks.Authorizers, hooks.ListFilters)
 	var handler http.Handler = mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
 		return mcpServer
 	}, &mcp.StreamableHTTPOptions{})
 	if authnProvider != nil {
-		handler = mcpAuthnMiddleware(authnProvider)(handler)
+		handler = mcpAuthnMiddleware(authnProvider, resourceMetadataURL)(handler)
 	}
-	// Mount the MCP handler under a mux that reserves /healthz for a 200-OK liveness probe.
-	// The bridge listener otherwise has no plain-HTTP endpoint that returns 200 (a bare GET
-	// yields 400).
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	mux.Handle("/", handler)
+	mux := buildMCPMux(handler, resourceMetadata)
 	addr := ":" + strconv.Itoa(int(cfg.MCPPort))
 	srv := &http.Server{
 		Addr:              addr,
@@ -539,24 +544,39 @@ func startMCPServer(
 	return srv
 }
 
-// mcpAuthnMiddleware uses the AuthnProvider to attach a session to the
-// request context on successful authentication. On auth error or missing
-// session, the request continues with an unauthenticated context — the
-// AuthzProvider downstream decides whether the request is allowed (the
-// OSS default `PublicAuthzProvider` permits read-only access; downstream
-// authz can reject). Failing-open here is intentional so the MCP bridge
-// works for anonymous `list_servers` / `get_server` traffic while still
-// letting authenticated callers pick up privileged operations.
-func mcpAuthnMiddleware(authn auth.AuthnProvider) func(http.Handler) http.Handler {
+// buildMCPMux assembles the registry MCP server's HTTP routes: a /healthz liveness
+// probe, plus protected-resource-metadata discovery served only when supplied the metadata.
+func buildMCPMux(handler http.Handler, resourceMetadata *oauthex.ProtectedResourceMetadata) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	if resourceMetadata != nil {
+		mux.Handle("/.well-known/oauth-protected-resource", mcpauth.ProtectedResourceMetadataHandler(resourceMetadata))
+		mux.Handle("/.well-known/oauth-protected-resource/", mcpauth.ProtectedResourceMetadataHandler(resourceMetadata))
+	}
+	mux.Handle("/", handler)
+	return mux
+}
+
+// mcpAuthnMiddleware validates the bearer via the AuthnProvider and attaches the
+// session so the tools' authz hooks run against the caller; missing or invalid
+// credentials get 401. When resourceMetadataURL is set, the 401 also carries the
+// RFC 9728 WWW-Authenticate challenge for client discovery. Installed only when
+// an AuthnProvider is configured.
+func mcpAuthnMiddleware(authn auth.AuthnProvider, resourceMetadataURL string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
 			session, err := authn.Authenticate(ctx, r.Header.Get, r.URL.Query())
 			if err == nil && session != nil {
-				ctx = auth.AuthSessionTo(ctx, session)
-				r = r.WithContext(ctx)
+				next.ServeHTTP(w, r.WithContext(auth.AuthSessionTo(ctx, session)))
+				return
 			}
-			next.ServeHTTP(w, r)
+			if resourceMetadataURL != "" {
+				w.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer resource_metadata=%q", resourceMetadataURL))
+			}
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		})
 	}
 }
