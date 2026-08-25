@@ -15,6 +15,7 @@ import (
 	"github.com/agentregistry-dev/agentregistry/pkg/api/v1alpha1"
 	"github.com/agentregistry-dev/agentregistry/pkg/registry/auth"
 	"github.com/agentregistry-dev/agentregistry/pkg/registry/database"
+	"github.com/agentregistry-dev/agentregistry/pkg/secret"
 )
 
 // DatabaseFactory is a function type that creates a store implementation.
@@ -76,6 +77,10 @@ type PostDelete func(ctx context.Context, obj v1alpha1.Object) error
 // batch's per-doc prepare hook. Used to mutate the decoded object
 // before persistence (e.g. strip sensitive spec fields).
 type Prepare func(ctx context.Context, obj v1alpha1.Object) error
+
+// UpsertError runs when the production metadata upsert fails after Prepare.
+// It allows Prepare hooks with external side effects to compensate them.
+type UpsertError func(ctx context.Context, obj v1alpha1.Object, cause error) error
 
 const (
 	AdmissionSourceApply  = "apply"
@@ -187,6 +192,9 @@ var NoopAuditor Auditor = noopAuditor{}
 // (internal/registry/registry_app.go) can reference it without a cyclic
 // import.
 type AppOptions struct {
+	// SecretStore supplies payload persistence for the OSS Secret service.
+	SecretStore secret.Store
+
 	// OpenAPISchemaNamer overrides Huma's default schema naming function.
 	// Use this when an application exposes same-named Go types from different
 	// packages; Huma's default namer omits package paths and panics on those

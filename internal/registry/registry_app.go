@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,13 +13,17 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/danielgtaylor/huma/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
 	mcpauth "github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/modelcontextprotocol/go-sdk/oauthex"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 
 	"github.com/agentregistry-dev/agentregistry/internal/cli/common/gitutil"
 	mcpregistry "github.com/agentregistry-dev/agentregistry/internal/mcp/registryserver"
@@ -38,6 +43,9 @@ import (
 	pkgdb "github.com/agentregistry-dev/agentregistry/pkg/registry/database"
 	"github.com/agentregistry-dev/agentregistry/pkg/registry/resource"
 	"github.com/agentregistry-dev/agentregistry/pkg/registry/v1alpha1store"
+	"github.com/agentregistry-dev/agentregistry/pkg/secret"
+	secretdatabase "github.com/agentregistry-dev/agentregistry/pkg/secret/database"
+	secretkubernetes "github.com/agentregistry-dev/agentregistry/pkg/secret/kubernetes"
 	"github.com/agentregistry-dev/agentregistry/pkg/types"
 )
 
@@ -99,6 +107,10 @@ func App(ctx context.Context, opts ...types.AppOptions) error {
 	maps.Copy(discoverySources, options.DeploymentDiscoverySources)
 	pool := db.Pool()
 	stores := buildStores(pool, options.V1Alpha1StoreTables, options.V1Alpha1MutableStoreKinds, options.Auditor)
+	secretStore, err := buildSecretStore(cfg, pool, options.SecretStore)
+	if err != nil {
+		return fmt.Errorf("initialize secret store: %w", err)
+	}
 	controllerConfig := deploymentControllerConfig(cfg)
 	controllerConfig.DependencyKinds = maps.Clone(options.DeploymentDependencyKinds)
 	if _, err := controller.StartDeploymentController(ctx, pool, stores, deploymentAdapters, discoverySources, controllerConfig); err != nil {
@@ -156,6 +168,7 @@ func App(ctx context.Context, opts ...types.AppOptions) error {
 	}()
 
 	perKindHooks := crudPerKindHooks(options)
+	wireSecretService(&perKindHooks, stores, secretStore)
 	routeOpts := buildRouteOptions(options, stores, deploymentAdapters, perKindHooks)
 
 	// Initialize HTTP server
@@ -271,6 +284,275 @@ func buildStores(pool *pgxpool.Pool, extraStoreTables map[string]string, mutable
 
 	slog.Info("v1alpha1 routes enabled")
 	return stores
+}
+
+func buildSecretStore(cfg *config.Config, pool *pgxpool.Pool, supplied secret.Store) (secret.Store, error) {
+	if supplied != nil {
+		return supplied, nil
+	}
+	switch secret.StoreType(cfg.SecretStore) {
+	case "":
+		return nil, nil
+	case secret.StoreTypeDatabase:
+		key, err := secret.LoadEncryptionKey(cfg.SecretStoreEncryptionKey)
+		if err != nil {
+			return nil, fmt.Errorf("invalid SECRET_STORE_ENCRYPTION_KEY: %w", err)
+		}
+		schema := pkgdb.OSSSchemaRegistry().MustGet(pkgdb.OSSSourceName)
+		persistence := v1alpha1store.NewSecretPayloadStore(pool, schema, "secret_payloads")
+		return secretdatabase.New(persistence, secret.NewStaticKeyProvider(key)), nil
+	case secret.StoreTypeKubernetes:
+		restConfig, err := rest.InClusterConfig()
+		if err != nil {
+			return nil, fmt.Errorf("load in-cluster Kubernetes config: %w", err)
+		}
+		client, err := kubernetes.NewForConfig(restConfig)
+		if err != nil {
+			return nil, fmt.Errorf("create Kubernetes client: %w", err)
+		}
+		return secretkubernetes.New(client.CoreV1(), cfg.SecretStoreNamespace), nil
+	default:
+		return nil, fmt.Errorf("unknown SECRET_STORE %q (want Database or Kubernetes)", cfg.SecretStore)
+	}
+}
+
+func wireSecretService(hooks *crud.PerKindHooks, stores map[string]*v1alpha1store.Store, payload secret.Store) {
+	metadata := stores[v1alpha1.KindSecret]
+	if metadata == nil {
+		return
+	}
+	if hooks.Prepares == nil {
+		hooks.Prepares = map[string]func(context.Context, v1alpha1.Object) error{}
+	}
+	if payload == nil {
+		hooks.Prepares[v1alpha1.KindSecret] = chainObjectHooks(hooks.Prepares[v1alpha1.KindSecret], secretStoreUnavailable)
+		return
+	}
+	service := secret.NewService(payload)
+	tx := &secretPayloadTransactions{store: payload}
+	if hooks.PostUpserts == nil {
+		hooks.PostUpserts = map[string]func(context.Context, v1alpha1.Object) error{}
+	}
+	if hooks.PostDeletes == nil {
+		hooks.PostDeletes = map[string]func(context.Context, v1alpha1.Object) error{}
+	}
+	if hooks.OnUpsertErrors == nil {
+		hooks.OnUpsertErrors = map[string]func(context.Context, v1alpha1.Object, error) error{}
+	}
+	hooks.Prepares[v1alpha1.KindSecret] = chainObjectHooks(hooks.Prepares[v1alpha1.KindSecret], secretPrepare(service, metadata, tx))
+	hooks.PostUpserts[v1alpha1.KindSecret] = chainObjectHooks(tx.commit, chainObjectHooks(secretStatusPostUpsert(metadata), hooks.PostUpserts[v1alpha1.KindSecret]))
+	hooks.OnUpsertErrors[v1alpha1.KindSecret] = chainUpsertErrorHooks(tx.rollback, hooks.OnUpsertErrors[v1alpha1.KindSecret])
+	hooks.PostDeletes[v1alpha1.KindSecret] = chainObjectHooks(hooks.PostDeletes[v1alpha1.KindSecret], secretPostDelete(service))
+}
+
+func secretStoreUnavailable(context.Context, v1alpha1.Object) error {
+	return huma.Error503ServiceUnavailable("secret payload store is not configured")
+}
+
+type secretPayloadSnapshot struct {
+	data    map[string][]byte
+	existed bool
+	lockKey string
+	lock    *secretPayloadLock
+}
+
+type secretPayloadTransactions struct {
+	store secret.Store
+	state sync.Map // map[*v1alpha1.Secret]secretPayloadSnapshot
+	mu    sync.Mutex
+	locks map[string]*secretPayloadLock
+}
+
+type secretPayloadLock struct {
+	sync.Mutex
+	refs int
+}
+
+func (t *secretPayloadTransactions) acquire(namespace, name string) (string, *secretPayloadLock) {
+	key := namespace + "/" + name
+	t.mu.Lock()
+	if t.locks == nil {
+		t.locks = map[string]*secretPayloadLock{}
+	}
+	lock := t.locks[key]
+	if lock == nil {
+		lock = &secretPayloadLock{}
+		t.locks[key] = lock
+	}
+	lock.refs++
+	t.mu.Unlock()
+	lock.Lock()
+	return key, lock
+}
+
+func (t *secretPayloadTransactions) release(key string, lock *secretPayloadLock) {
+	lock.Unlock()
+	t.mu.Lock()
+	lock.refs--
+	if lock.refs == 0 {
+		delete(t.locks, key)
+	}
+	t.mu.Unlock()
+}
+
+func (t *secretPayloadTransactions) snapshot(ctx context.Context, value *v1alpha1.Secret, namespace string) error {
+	lockKey, lock := t.acquire(namespace, value.Metadata.Name)
+	data, err := t.store.Get(ctx, namespace, value.Metadata.Name)
+	snapshot := secretPayloadSnapshot{data: data, existed: err == nil, lockKey: lockKey, lock: lock}
+	if err != nil && !errors.Is(err, secret.ErrPayloadNotFound) {
+		t.release(lockKey, lock)
+		return fmt.Errorf("load prior secret payload: %w", err)
+	}
+	t.state.Store(value, snapshot)
+	return nil
+}
+
+func (t *secretPayloadTransactions) commit(_ context.Context, obj v1alpha1.Object) error {
+	if value, ok := obj.(*v1alpha1.Secret); ok {
+		if stored, loaded := t.state.LoadAndDelete(value); loaded {
+			snapshot := stored.(secretPayloadSnapshot)
+			t.release(snapshot.lockKey, snapshot.lock)
+		}
+	}
+	return nil
+}
+
+func (t *secretPayloadTransactions) rollback(ctx context.Context, obj v1alpha1.Object, _ error) error {
+	value, ok := obj.(*v1alpha1.Secret)
+	if !ok {
+		return nil
+	}
+	stored, ok := t.state.LoadAndDelete(value)
+	if !ok {
+		return nil
+	}
+	snapshot := stored.(secretPayloadSnapshot)
+	defer t.release(snapshot.lockKey, snapshot.lock)
+	namespace := value.Metadata.Namespace
+	if namespace == "" {
+		namespace = v1alpha1.DefaultNamespace
+	}
+	if snapshot.existed {
+		if err := t.store.Put(ctx, namespace, value.Metadata.Name, snapshot.data); err != nil {
+			return fmt.Errorf("restore prior secret payload: %w", err)
+		}
+		return nil
+	}
+	if err := t.store.Delete(ctx, namespace, value.Metadata.Name); err != nil {
+		return fmt.Errorf("delete orphaned secret payload: %w", err)
+	}
+	return nil
+}
+
+type secretMetadataStore interface {
+	GetLatest(ctx context.Context, namespace, name string) (*v1alpha1.RawObject, error)
+	PatchStatus(ctx context.Context, namespace, name, tag string, mutate func(json.RawMessage) (json.RawMessage, error)) error
+}
+
+func secretPrepare(service *secret.Service, metadata secretMetadataStore, tx *secretPayloadTransactions) func(context.Context, v1alpha1.Object) error {
+	return func(ctx context.Context, obj v1alpha1.Object) error {
+		value, ok := obj.(*v1alpha1.Secret)
+		if !ok {
+			return nil
+		}
+		namespace := value.Metadata.Namespace
+		if namespace == "" {
+			namespace = v1alpha1.DefaultNamespace
+		}
+		existing, err := metadata.GetLatest(ctx, namespace, value.Metadata.Name)
+		if err == nil && existing != nil {
+			var spec v1alpha1.SecretSpec
+			if err := json.Unmarshal(existing.Spec, &spec); err != nil {
+				return huma.Error500InternalServerError("decode existing secret spec", err)
+			}
+			if spec.Immutable {
+				return huma.Error409Conflict("secret is immutable; delete and recreate to change it")
+			}
+		} else if err != nil && !errors.Is(err, pkgdb.ErrNotFound) {
+			return huma.Error500InternalServerError("load existing secret", err)
+		}
+		data, err := value.MergedData()
+		if err != nil {
+			return huma.Error400BadRequest("invalid secret data: " + err.Error())
+		}
+		if len(data) == 0 {
+			return huma.Error400BadRequest("secret data must not be empty")
+		}
+		if err := tx.snapshot(ctx, value, namespace); err != nil {
+			return huma.Error500InternalServerError("snapshot secret payload", err)
+		}
+		if err := service.PutPayload(ctx, namespace, value.Metadata.Name, data); err != nil {
+			rollbackErr := tx.rollback(context.WithoutCancel(ctx), value, err)
+			return huma.Error500InternalServerError("persist secret payload", errors.Join(err, rollbackErr))
+		}
+		value.StripValues(data)
+		return nil
+	}
+}
+
+func secretStatusPostUpsert(metadata secretMetadataStore) func(context.Context, v1alpha1.Object) error {
+	return func(ctx context.Context, obj v1alpha1.Object) error {
+		value, ok := obj.(*v1alpha1.Secret)
+		if !ok {
+			return nil
+		}
+		status, err := value.MarshalStatus()
+		if err != nil {
+			return huma.Error500InternalServerError("marshal secret status", err)
+		}
+		if len(status) == 0 {
+			status = []byte("{}")
+		}
+		meta := value.GetMetadata()
+		namespace := meta.Namespace
+		if namespace == "" {
+			namespace = v1alpha1.DefaultNamespace
+		}
+		err = metadata.PatchStatus(ctx, namespace, meta.Name, "", func(json.RawMessage) (json.RawMessage, error) {
+			return status, nil
+		})
+		if err != nil {
+			return huma.Error500InternalServerError("persist secret status", err)
+		}
+		return nil
+	}
+}
+
+func secretPostDelete(service *secret.Service) func(context.Context, v1alpha1.Object) error {
+	return func(ctx context.Context, obj v1alpha1.Object) error {
+		meta := obj.GetMetadata()
+		if err := service.DeletePayload(ctx, meta.Namespace, meta.Name); err != nil {
+			return huma.Error500InternalServerError("delete secret payload", err)
+		}
+		return nil
+	}
+}
+
+func chainObjectHooks(first, second func(context.Context, v1alpha1.Object) error) func(context.Context, v1alpha1.Object) error {
+	return func(ctx context.Context, obj v1alpha1.Object) error {
+		if first != nil {
+			if err := first(ctx, obj); err != nil {
+				return err
+			}
+		}
+		if second != nil {
+			return second(ctx, obj)
+		}
+		return nil
+	}
+}
+
+func chainUpsertErrorHooks(first, second func(context.Context, v1alpha1.Object, error) error) func(context.Context, v1alpha1.Object, error) error {
+	return func(ctx context.Context, obj v1alpha1.Object, cause error) error {
+		var firstErr, secondErr error
+		if first != nil {
+			firstErr = first(ctx, obj, cause)
+		}
+		if second != nil {
+			secondErr = second(ctx, obj, cause)
+		}
+		return errors.Join(firstErr, secondErr)
+	}
 }
 
 func deploymentControllerConfig(cfg *config.Config) controller.ControllerConfig {
