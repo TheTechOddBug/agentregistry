@@ -117,13 +117,22 @@ func (c *DeploymentController) apply(ctx context.Context, deployment *v1alpha1.D
 	}
 	result, err := adapter.Apply(ctx, input)
 	if err != nil {
+		if c.DeploymentApplied != nil {
+			c.DeploymentApplied(ctx, input, nil, err)
+		}
 		if errors.Is(err, v1alpha1.ErrDanglingRef) {
 			return c.blockReference(ctx, deployment, err)
 		}
 		return "", "", fmt.Errorf("adapter %q apply: %w", adapter.Type(), err)
 	}
 	if err := c.persistApplyResult(ctx, deployment, result, fingerprint, forceToken, fingerprintResult.Dependencies); err != nil {
+		if c.DeploymentApplied != nil {
+			c.DeploymentApplied(ctx, input, result, err)
+		}
 		return "", "", err
+	}
+	if c.DeploymentApplied != nil {
+		c.DeploymentApplied(ctx, input, result, nil)
 	}
 	return "success", "deployment applied", nil
 }
